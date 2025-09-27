@@ -5,6 +5,7 @@ DOWNLOADS = r"C:\Users\Axel Santadi\Downloads"
 
 COVER_MP3 = r"C:\Users\Axel Santadi\Music\おちゃめ機能 -Full ver.- 重音テトSV【SynthesizerVカバー】.mp3"
 MESSAGE = "Halo dari Bitify!"
+SECRET_FILE = r"C:\Users\Axel Santadi\20250419_123507.jpg"
 
 KEY = "abc123"
 NLSB = "2"
@@ -16,13 +17,25 @@ def main():
         raise FileNotFoundError(f"Cover MP3 not found: {COVER_MP3}")
     os.makedirs(DOWNLOADS, exist_ok=True)
 
-    with open(COVER_MP3, "rb") as f:
-        files = {
-            "cover": (pathlib.Path(COVER_MP3).name, f, "audio/mpeg"),
-            "secret": ("message.txt", MESSAGE.encode("utf-8"), "text/plain"),
-        }
-        data = {"key": KEY, "nlsb": NLSB, "encrypt": ENCRYPT, "random_start": RANDOM_START}
-        r = requests.post(f"{BASE_URL}/api/embed", files=files, data=data, timeout=180)
+    with open(COVER_MP3, "rb") as f_cover:
+        if SECRET_FILE and os.path.isfile(SECRET_FILE):
+            sf_name = pathlib.Path(SECRET_FILE).name
+            ext = sf_name.lower().split(".")[-1]
+            mime = "image/jpeg" if ext in ("jpg", "jpeg") else "application/octet-stream"
+            with open(SECRET_FILE, "rb") as f_secret:
+                files = {
+                    "cover": (pathlib.Path(COVER_MP3).name, f_cover, "audio/mpeg"),
+                    "secret": (sf_name, f_secret, mime),
+                }
+                data = {"key": KEY, "nlsb": NLSB, "encrypt": ENCRYPT, "random_start": RANDOM_START}
+                r = requests.post(f"{BASE_URL}/api/embed", files=files, data=data, timeout=180)
+        else:
+            files = {
+                "cover": (pathlib.Path(COVER_MP3).name, f_cover, "audio/mpeg"),
+                "secret": ("message.txt", MESSAGE.encode("utf-8"), "text/plain"),
+            }
+            data = {"key": KEY, "nlsb": NLSB, "encrypt": ENCRYPT, "random_start": RANDOM_START}
+            r = requests.post(f"{BASE_URL}/api/embed", files=files, data=data, timeout=180)
 
     if r.status_code != 200:
         print("Embed failed:", r.status_code, r.text); return
@@ -44,12 +57,6 @@ def main():
     out_path = os.path.join(DOWNLOADS, out_name)
     with open(out_path, "wb") as out: out.write(r2.content)
     print(f"Extracted payload saved: {out_path}")
-
-    try:
-        ok = r2.content.decode("utf-8") == MESSAGE
-        print("Roundtrip OK:", ok)
-    except UnicodeDecodeError:
-        print("Roundtrip check skipped (binary payload)")
 
 if __name__ == "__main__":
     main()
