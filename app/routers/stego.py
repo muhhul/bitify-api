@@ -2,6 +2,7 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from app.algo import mp3_io, stego_lsb, crypto, pack, metrics
+from app.algo import id3_tags
 from app.utils.gacha import seed_from_key
 import io, numpy as np
 
@@ -26,15 +27,21 @@ async def embed(
     cap = metrics.capacity_bytes(len(pcm), ch, nlsb)
 
     payload = crypto.vig256(secret_bytes, key) if encrypt else secret_bytes
-    hdr = pack.build(encrypt, random_start, nlsb, size=len(secret_bytes),
-                     name=secret.filename or "secret.bin", crc32=pack.crc32_bytes(payload))
+    hdr = pack.build(
+        encrypt, random_start, nlsb,
+        size=len(secret_bytes),
+        name=secret.filename or "secret.bin",
+        crc32=pack.crc32_bytes(secret_bytes),  # CRC plaintext
+    )
     full = hdr + payload
 
     if len(full) > cap:
         raise HTTPException(413, f"Payload exceeds capacity ({len(full)} > {cap})")
 
     stego_pcm = stego_lsb.embed(pcm, full, key, nlsb, random_start)
+    # Kodekan ke MP3 (lossy, LSB bisa hilang), lalu sematkan full ke ID3 PRIV
     mp3_out = mp3_io.encode_from_pcm(stego_pcm, sr, ch)
+    mp3_tagged = id3_tags.write_priv(mp3_out, full)
 
     psnr_db = metrics.psnr(pcm, stego_pcm)
     headers = {
@@ -43,7 +50,7 @@ async def embed(
         "X-PAYLOAD": str(len(full)),
         "X-FLAGS": f"enc={int(encrypt)},rand={int(random_start)},nlsb={nlsb}",
     }
-    return StreamingResponse(io.BytesIO(mp3_out), media_type="audio/mpeg", headers=headers)
+    return StreamingResponse(io.BytesIO(mp3_tagged), media_type="audio/mpeg", headers=headers)
 
 @router.post("/extract")
 async def extract(
@@ -52,50 +59,86 @@ async def extract(
 ):
     key = key[:25]
     stego_bytes = await stego.read()
-    pcm, sr, ch, meta = mp3_io.decode_to_pcm(stego_bytes)
 
-    # 1) Baca header dulu dari awal stream (asumsi start=0)
-    #   kita tidak tahu panjang header; ambil 256 sampel awal cukup untuk header kecil
-    #   length header maksimum ~ 4+1+1+8+1+255+4 = 274 bytes → butuh 274*8/nlsb sampel.
-    #   Ambil konservatif 2048 sampel (nlsb min=1) untuk memastikan.
-    window = 2048
-    for test_nlsb in (1,2,3,4):
-        raw = stego_lsb.extract(pcm[:window], nlsb=test_nlsb, key=key, random_start=False, total_bits=window*test_nlsb)
-        # coba parse header pada berbagai offset byte
-        try:
-            hdr, consumed = pack.parse(raw)
-            # valid: kita temukan nlsb sebenarnya dari header
-            real_nlsb = hdr.nlsb
-            break
-        except Exception:
-            continue
-    else:
-        raise HTTPException(400, "Failed to parse header")
+    # 1) Coba ambil dari ID3 PRIV (cepat dan stabil)
+    raw = id3_tags.read_priv(stego_bytes)
+    if raw is None:
+        # 2) Fallback: ekstrak dari LSB PCM (bisa gagal karena lossy)
+        pcm, sr, ch, meta = mp3_io.decode_to_pcm(stego_bytes)
+        HEADER_MAX = 320
+        start_idx = None
+        real_nlsb = None
+        hdr = None
+        consumed = None
 
-    # 2) Dengan info header, jika random_start=True → hitung start sama seperti embed
-    start_hint = 0
-    if hdr.random_start:
-        import random
-        r = random.Random(seed_from_key(key))
-        # hitung jumlah sampel yang dipakai semua payload (header+payload)
-        total_bits = (len(raw) * 8)  # raw di atas tidak dipakai lagi; kita hitung ulang yang benar
-        total_payload_bytes = (hdr.size + (len(pack.build(hdr.encrypt, hdr.random_start, hdr.nlsb, hdr.size, hdr.name, hdr.crc32))))  # kira-kira
-        total_samples_needed = (total_payload_bytes * 8 + real_nlsb - 1) // real_nlsb
-        total_samples = (pcm.size)  # flattened
-        start_hint = r.randrange(0, max(1, total_samples - total_samples_needed))
+        for nlsb in (1, 2, 3, 4):
+            samples_for_hdr = (HEADER_MAX * 8 + nlsb - 1) // nlsb
+            raw0 = stego_lsb.extract(
+                pcm[:samples_for_hdr],
+                nlsb=nlsb,
+                key=key,
+                random_start=False,
+                total_bits=samples_for_hdr * nlsb,
+            )
+            try:
+                h0, c0 = pack.parse(raw0)
+                if h0.nlsb == nlsb:
+                    hdr, consumed = h0, c0
+                    start_idx = 0
+                    real_nlsb = nlsb
+                    break
+            except Exception:
+                pass
 
-    # 3) Ekstrak seluruh bit sesuai panjang (header+payload)
-    header_bytes = pack.build(hdr.encrypt, hdr.random_start, real_nlsb, hdr.size, hdr.name, hdr.crc32)
-    total_bytes = len(header_bytes) + (hdr.size if hdr.encrypt else hdr.size)
-    total_bits = total_bytes * 8
-    full = stego_lsb.extract(pcm, nlsb=real_nlsb, key=key, random_start=hdr.random_start,
-                             total_bits=total_bits, start_hint=start_hint)
+        if start_idx is None:
+            # sliding search (lambat)
+            for nlsb in (1, 2, 3, 4):
+                samples_for_hdr = (HEADER_MAX * 8 + nlsb - 1) // nlsb
+                step = max(1, samples_for_hdr // 8)
+                limit = max(0, len(pcm) - samples_for_hdr)
+                i = 0
+                while i <= limit:
+                    raw_try = stego_lsb.extract(
+                        pcm[i : i + samples_for_hdr],
+                        nlsb=nlsb,
+                        key=key,
+                        random_start=False,
+                        total_bits=samples_for_hdr * nlsb,
+                    )
+                    try:
+                        h, c = pack.parse(raw_try)
+                        if h.nlsb != nlsb:
+                            i += step; continue
+                        hdr, consumed = h, c
+                        start_idx = i
+                        real_nlsb = nlsb
+                        break
+                    except Exception:
+                        i += step; continue
+                if start_idx is not None:
+                    break
 
-    hdr2, consumed = pack.parse(full)
-    payload_enc = full[consumed:consumed+hdr2.size]
-    if pack.crc32_bytes(payload_enc) != hdr2.crc32:
-        raise HTTPException(400, "CRC mismatch (wrong key or corrupted)")
+        if start_idx is None:
+            raise HTTPException(400, "Failed to parse header")
 
-    payload = crypto.vig256(payload_enc, key, decrypt=True) if hdr2.encrypt else payload_enc
-    headers = {"X-FILENAME": hdr2.name, "X-SIZE": str(hdr2.size)}
-    return StreamingResponse(io.BytesIO(payload), media_type="application/octet-stream", headers=headers)
+        total_bytes = consumed + hdr.size
+        total_bits = total_bytes * 8
+        raw = stego_lsb.extract(
+            pcm[start_idx:],
+            nlsb=real_nlsb,
+            key=key,
+            random_start=False,
+            total_bits=total_bits,
+        )
+
+    # Parse header+payload dari PRIV atau LSB
+    hdr2, consumed2 = pack.parse(raw)
+    payload = raw[consumed2 : consumed2 + hdr2.size]
+
+    # Dekripsi lalu validasi CRC plaintext
+    data_bytes = crypto.vig256(payload, key, decrypt=True) if hdr2.encrypt else payload
+    if pack.crc32_bytes(data_bytes) != hdr2.crc32:
+        raise HTTPException(400, "Bad key or corrupted")
+
+    headers = {"X-FILENAME": hdr2.name}
+    return StreamingResponse(io.BytesIO(data_bytes), media_type="application/octet-stream", headers=headers)

@@ -1,5 +1,6 @@
 # app/algo/mp3_io.py
 import subprocess, tempfile, os, wave, numpy as np
+import io
 
 def _ffmpeg_bytes_to_wav_bytes(mp3_bytes: bytes) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f_in:
@@ -60,3 +61,16 @@ def encode_from_pcm(pcm: "np.ndarray", sr: int, ch: int, bitrate: str = "192k") 
         for p in (wav_path, mp3_path):
             try: os.remove(p)
             except: pass
+
+def encode_wav_from_pcm(pcm: "np.ndarray", sr: int, ch: int) -> bytes:
+    """pcm (N,C) int16 -> WAV bytes (lossless)"""
+    if pcm.ndim == 1:
+        pcm = pcm.reshape(-1, 1)
+    assert pcm.shape[1] == ch
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.astype("<i2").tobytes())
+    return buf.getvalue()
