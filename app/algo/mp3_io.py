@@ -15,12 +15,13 @@ def _ffmpeg_bytes_to_wav_bytes(mp3_bytes: bytes) -> bytes:
         for p in (in_path, out_path):
             try: os.remove(p)
             except: pass
+    return pcm.copy(), sr, ch, meta
 
 def decode_to_pcm(mp3_bytes: bytes):
     """return pcm:int16 ndarray shape (N, C), sr:int, ch:int"""
     wav_bytes = _ffmpeg_bytes_to_wav_bytes(mp3_bytes)
-    with wave.open(tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name, "wb") as _:
-        pass  # placeholder to please type checkers
+    # with wave.open(tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name, "wb") as _:
+        # pass  # placeholder to please type checkers
     import io
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         ch = w.getnchannels()
