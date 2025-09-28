@@ -1,35 +1,64 @@
 # app/routers/stego.py
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from app.algo import mp3_io, stego_lsb, crypto, pack, metrics
 from app.algo import id3_tags
 from app.utils.gacha import seed_from_key
 import io, numpy as np
+import time, uuid
+import mimetypes
 
 router = APIRouter()
 
+STEGO_STORE: dict[str, dict] = {}
+STEGO_TTL_SEC = 600  # 10 menit
+
+def _put_stego(data: bytes, mime: str = "audio/mpeg", filename: str = "stego.mp3") -> str:
+    token = uuid.uuid4().hex
+    STEGO_STORE[token] = {"data": data, "mime": mime, "ts": time.time(), "filename": filename}
+    # cleanup sederhana
+    now = time.time()
+    dead = [k for k, v in STEGO_STORE.items() if now - v["ts"] > STEGO_TTL_SEC]
+    for k in dead:
+        STEGO_STORE.pop(k, None)
+    return token
+
+@router.get("/download/{token}")
+def download(token: str):
+    item = STEGO_STORE.get(token)
+    if not item:
+        raise HTTPException(404, "Not found")
+    headers = {
+        "Content-Disposition": f'attachment; filename="{item["filename"]}"',
+        "Content-Length": str(len(item["data"])),
+    }
+    return StreamingResponse(io.BytesIO(item["data"]), media_type=item["mime"], headers=headers)
+
 @router.post("/check-capacity")
-async def check_capacity(mp3: UploadFile = File(...)):
-    """Hitung kapasitas maksimal (bytes) untuk nlsb=1..4."""
-    mp3_bytes = await mp3.read()
+async def check_capacity(
+    coverAudio: UploadFile = File(...),
+    lsbBits: int = Form(...),
+):
+    """Hitung kapasitas maksimal (bytes) untuk lsbBits (1..8)."""
+    if not (1 <= lsbBits <= 8):
+        raise HTTPException(422, "lsbBits must be 1..8")
+
+    mp3_bytes = await coverAudio.read()
     try:
         pcm, sr, ch, meta = mp3_io.decode_to_pcm(mp3_bytes)
     except Exception as e:
         raise HTTPException(400, f"Failed to decode MP3: {e}")
     frames = len(pcm)
-    capacities = {str(n): metrics.capacity_bytes(frames, ch, n) for n in range(1, 9)}
-    # Header Bitify minimal 19 byte + panjang nama file (0..255)
+    max_bytes = metrics.capacity_bytes(frames, ch, lsbBits)
+
     return {
-        "sample_rate": sr,
-        "channels": ch,
-        "frames": frames,
-        "duration_sec": frames / sr if sr else None,
-        "capacities": capacities,
-        "header_overhead_min_bytes": 19,
+        "maxCapacityBytes": int(max_bytes),
+        "maxCapacityMB": round(max_bytes / (1024 * 1024), 2),
     }
 
 @router.post("/embed")
 async def embed(
+    request: Request,
     cover: UploadFile = File(...),
     secret: UploadFile = File(...),
     key: str = Form(...),
@@ -51,7 +80,7 @@ async def embed(
         encrypt, random_start, nlsb,
         size=len(secret_bytes),
         name=secret.filename or "secret.bin",
-        crc32=pack.crc32_bytes(secret_bytes),  # CRC plaintext
+        crc32=pack.crc32_bytes(secret_bytes),
     )
     full = hdr + payload
 
@@ -59,21 +88,31 @@ async def embed(
         raise HTTPException(413, f"Payload exceeds capacity ({len(full)} > {cap})")
 
     stego_pcm = stego_lsb.embed(pcm, full, key, nlsb, random_start)
-    # Kodekan ke MP3 (lossy, LSB bisa hilang), lalu sematkan full ke ID3 PRIV
     mp3_out = mp3_io.encode_from_pcm(stego_pcm, sr, ch)
     mp3_tagged = id3_tags.write_priv(mp3_out, full)
 
     psnr_db = metrics.psnr(pcm, stego_pcm)
-    headers = {
-        "X-PSNR": f"{psnr_db:.2f}",
-        "X-CAPACITY": str(cap),
-        "X-PAYLOAD": str(len(full)),
-        "X-FLAGS": f"enc={int(encrypt)},rand={int(random_start)},nlsb={nlsb}",
+    # Skor kualitas sederhana: 0 pada 20 dB, 100 pada 60 dB (dibatasi 0..100)
+    quality = max(0.0, min(100.0, (psnr_db - 20.0) * (100.0 / 40.0)))
+
+    token = _put_stego(mp3_tagged, mime="audio/mpeg", filename="stego.mp3")
+    base = str(request.base_url).rstrip("/")
+    stego_url = f"{base}/api/download/{token}"
+
+    return {
+        "success": True,
+        "stegoAudioUrl": stego_url,
+        # stegoAudioBlob tidak dikirim dari server; frontend bisa fetch URL ini dan membuat Blob sendiri.
+        "stegoAudioBlob": None,
+        "psnr": round(psnr_db, 2),
+        "qualityScore": round(quality, 0),
+        "fileSize": len(mp3_tagged),
+        "message": "OK",
     }
-    return StreamingResponse(io.BytesIO(mp3_tagged), media_type="audio/mpeg", headers=headers)
 
 @router.post("/extract")
 async def extract(
+    request: Request,                 # ADD: untuk membangun URL unduhan
     stego: UploadFile = File(...),
     key: str = Form(...),
 ):
@@ -160,5 +199,18 @@ async def extract(
     if pack.crc32_bytes(data_bytes) != hdr2.crc32:
         raise HTTPException(400, "Bad key or corrupted")
 
-    headers = {"X-FILENAME": hdr2.name}
-    return StreamingResponse(io.BytesIO(data_bytes), media_type="application/octet-stream", headers=headers)
+    # Simpan ke store dan kembalikan JSON ExtractResponse
+    mime = mimetypes.guess_type(hdr2.name)[0] or "application/octet-stream"
+    token = _put_stego(data_bytes, mime=mime, filename=hdr2.name)
+    base = str(request.base_url).rstrip("/")
+    file_url = f"{base}/api/download/{token}"
+
+    return {
+        "success": True,
+        "extractedFileUrl": file_url,
+        "extractedFileBlob": None,
+        "originalFileName": hdr2.name,
+        "fileSizeBytes": len(data_bytes),
+        "fileType": mime,
+        "message": "OK",
+    }
