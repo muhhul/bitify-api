@@ -23,16 +23,13 @@ def embed(pcm: np.ndarray, payload: bytes, key: str, nlsb: int, random_start: bo
     if len(payload) > cap:
         raise ValueError("payload exceeds capacity")
 
-    # bitstream dari payload
     bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
 
-    # posisi awal
     start = 0
     if random_start:
         r = rng_from_key(key)
         start = r.randrange(0, max(1, total_samples - (len(bits)+nlsb-1)//nlsb))
 
-    # tulis per nlsb
     idx = start
     mask_keep = ~((1<<nlsb)-1)
     for i in range(0, len(bits), nlsb):
@@ -61,18 +58,15 @@ def extract(
     total_samples = stream.size
 
     if random_start and start_hint is None:
-        # saat ekstraksi kita akan membaca header dulu (panjang diketahui sedikit)
         raise ValueError("start_hint required for random_start in generic extract")
 
     idx = start_hint or 0
     chunks = []
     for _ in range(0, total_bits, nlsb):
         value = stream[idx] & ((1<<nlsb)-1)
-        # ubah ke nlsb bits
         chunk = [(value >> (nlsb-1-i)) & 1 for i in range(nlsb)]
         chunks.extend(chunk)
         idx += 1
-    # potong ke total_bits persis
     bits = np.array(chunks[:total_bits], dtype=np.uint8)
     bys = np.packbits(bits).tobytes()
     return bys

@@ -21,8 +21,6 @@ def _ffmpeg_bytes_to_wav_bytes(mp3_bytes: bytes) -> bytes:
 def decode_to_pcm(mp3_bytes: bytes):
     """return pcm:int16 ndarray shape (N, C), sr:int, ch:int"""
     wav_bytes = _ffmpeg_bytes_to_wav_bytes(mp3_bytes)
-    # with wave.open(tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name, "wb") as _:
-        # pass  # placeholder to please type checkers
     import io
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         ch = w.getnchannels()
@@ -42,7 +40,6 @@ def encode_from_pcm(pcm: "np.ndarray", sr: int, ch: int, bitrate: str = "192k") 
     if pcm.ndim == 1:
         pcm = pcm.reshape(-1, 1)
     assert pcm.shape[1] == ch
-    # tulis WAV sementara
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_wav:
         import wave
         with wave.open(f_wav, "wb") as w:

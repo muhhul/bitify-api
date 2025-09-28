@@ -3,7 +3,7 @@ import tempfile, os
 from typing import Optional
 from mutagen.id3 import ID3, ID3NoHeaderError, PRIV
 
-OWNER = "bitify"  # identifier khusus kita
+OWNER = "bitify"
 
 def write_priv(mp3_bytes: bytes, data: bytes, owner: str = OWNER) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
@@ -14,7 +14,6 @@ def write_priv(mp3_bytes: bytes, data: bytes, owner: str = OWNER) -> bytes:
             id3 = ID3(path)
         except ID3NoHeaderError:
             id3 = ID3()
-        # Hapus PRIV lama milik owner yang sama
         for key in list(id3.keys()):
             fr = id3.getall(key)
             for frame in fr:
