@@ -8,6 +8,26 @@ import io, numpy as np
 
 router = APIRouter()
 
+@router.post("/check-capacity")
+async def check_capacity(mp3: UploadFile = File(...)):
+    """Hitung kapasitas maksimal (bytes) untuk nlsb=1..4."""
+    mp3_bytes = await mp3.read()
+    try:
+        pcm, sr, ch, meta = mp3_io.decode_to_pcm(mp3_bytes)
+    except Exception as e:
+        raise HTTPException(400, f"Failed to decode MP3: {e}")
+    frames = len(pcm)
+    capacities = {str(n): metrics.capacity_bytes(frames, ch, n) for n in (1, 2, 3, 4)}
+    # Header Bitify minimal 19 byte + panjang nama file (0..255)
+    return {
+        "sample_rate": sr,
+        "channels": ch,
+        "frames": frames,
+        "duration_sec": frames / sr if sr else None,
+        "capacities": capacities,
+        "header_overhead_min_bytes": 19,
+    }
+
 @router.post("/embed")
 async def embed(
     cover: UploadFile = File(...),
