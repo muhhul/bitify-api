@@ -22,25 +22,25 @@ def _human(n: int) -> str:
         n /= 1024
     return f"{n:.1f}TB"
 
-def check_capacity(cover_path: str):
+def check_capacity(cover_path: str, lsb_bits: int):
     with open(cover_path, "rb") as f:
-        files = {"mp3": (pathlib.Path(cover_path).name, f, "audio/mpeg")}
-        r = requests.post(f"{BASE_URL}/api/check-capacity", files=files, timeout=TIMEOUT)
+        files = {"coverAudio": (pathlib.Path(cover_path).name, f, "audio/mpeg")}
+        data = {"lsbBits": str(int(lsb_bits))}
+        r = requests.post(f"{BASE_URL}/api/check-capacity", files=files, data=data, timeout=TIMEOUT)
     if r.status_code != 200:
         raise RuntimeError(f"check-capacity failed: {r.status_code} {r.text}")
-    return r.json()
+    return r.json()  # { maxCapacityBytes, maxCapacityMB }
 
 def main():
     if not os.path.isfile(COVER_MP3):
         raise FileNotFoundError(f"Cover MP3 not found: {COVER_MP3}")
     os.makedirs(DOWNLOADS, exist_ok=True)
 
-    # 1) Cek kapasitas
-    info = check_capacity(COVER_MP3)
-    caps = info["capacities"]  # dict: "1","2","3","4" -> bytes
-    nlsb = str(int(NLSB))      # normalisasi
-    if nlsb not in caps:
-        raise ValueError(f"Invalid NLSB: {NLSB}")
+    nlsb = str(int(NLSB))  # normalisasi
+
+    # 1) Cek kapasitas untuk NLSB terpilih
+    info = check_capacity(COVER_MP3, int(nlsb))
+    cap = int(info["maxCapacityBytes"])
 
     # Hitung kebutuhan total = header(19 + len(nama)) + payload
     if SECRET_FILE and os.path.isfile(SECRET_FILE):
@@ -51,7 +51,6 @@ def main():
         payload_size = len(MESSAGE.encode("utf-8"))
     header_overhead = 19 + _utf8_len(name)
     need = header_overhead + payload_size
-    cap = int(caps[nlsb])
 
     print(f"Capacity (nlsb={nlsb}): {cap} bytes | Need: {need} bytes "
           f"(header {header_overhead}, payload {_human(payload_size)})")
@@ -59,7 +58,7 @@ def main():
         print(f"Payload exceeds capacity ({need} > {cap}). Pilih lagu lebih panjang atau naikkan NLSB.")
         return
 
-    # 2) Embed
+    # 2) Embed → terima JSON EmbedResponse, lalu unduh stegoAudioUrl
     with open(COVER_MP3, "rb") as f_cover:
         if SECRET_FILE and os.path.isfile(SECRET_FILE):
             sf_name = pathlib.Path(SECRET_FILE).name
@@ -83,12 +82,23 @@ def main():
     if r.status_code != 200:
         print("Embed failed:", r.status_code, r.text); return
 
-    psnr = r.headers.get("X-PSNR"); cap_hdr = r.headers.get("X-CAPACITY"); payload_hdr = r.headers.get("X-PAYLOAD")
-    stego_path = os.path.join(DOWNLOADS, "stego_out.mp3")
-    with open(stego_path, "wb") as out: out.write(r.content)
-    print(f"Stego saved: {stego_path} | PSNR={psnr} dB, capacity={cap_hdr}, payload={payload_hdr} bytes")
+    eresp = r.json()
+    if not eresp.get("success"):
+        print("Embed not successful:", eresp); return
 
-    # 3) Extract
+    stego_url = eresp["stegoAudioUrl"]
+    psnr = eresp.get("psnr"); q = eresp.get("qualityScore"); fsize = eresp.get("fileSize")
+    print(f"Embed OK | PSNR={psnr} dB, quality={q}, size={_human(fsize)} | url={stego_url}")
+
+    stego_path = os.path.join(DOWNLOADS, "stego_out.mp3")
+    r_dl = requests.get(stego_url, timeout=TIMEOUT)
+    if r_dl.status_code != 200:
+        print("Download stego failed:", r_dl.status_code, r_dl.text); return
+    with open(stego_path, "wb") as out:
+        out.write(r_dl.content)
+    print(f"Stego saved: {stego_path}")
+
+    # 3) Extract → terima JSON ExtractResponse, lalu unduh extractedFileUrl
     with open(stego_path, "rb") as f:
         files = {"stego": ("stego.mp3", f, "audio/mpeg")}
         data = {"key": KEY}
@@ -97,10 +107,20 @@ def main():
     if r2.status_code != 200:
         print("Extract failed:", r2.status_code, r2.text); return
 
-    out_name = r2.headers.get("X-FILENAME") or "extracted.bin"
-    out_path = os.path.join(DOWNLOADS, out_name)
-    with open(out_path, "wb") as out: out.write(r2.content)
-    print(f"Extracted payload saved: {out_path}")
+    xresp = r2.json()
+    if not xresp.get("success"):
+        print("Extract not successful:", xresp); return
+
+    extracted_url = xresp["extractedFileUrl"]
+    orig_name = xresp.get("originalFileName") or "extracted.bin"
+    out_path = os.path.join(DOWNLOADS, orig_name)
+
+    r_xd = requests.get(extracted_url, timeout=TIMEOUT)
+    if r_xd.status_code != 200:
+        print("Download extracted failed:", r_xd.status_code, r_xd.text); return
+    with open(out_path, "wb") as out:
+        out.write(r_xd.content)
+    print(f"Extracted payload saved: {out_path} ({_human(len(r_xd.content))}, type={xresp.get('fileType')})")
 
 if __name__ == "__main__":
     main()
