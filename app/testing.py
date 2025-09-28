@@ -8,7 +8,7 @@ MESSAGE = "Halo dari Bitify!"
 SECRET_FILE = r"C:\Users\Axel Santadi\Downloads\Sorasaki.Hina.full.3919571.jpg"  # set None untuk kirim MESSAGE
 
 KEY = "abc123"
-NLSB = "2"              # "1".."4"
+NLSB = "8"              # "1".."8"
 ENCRYPT = "true"        # "true"/"false"
 RANDOM_START = "false"  # "true"/"false"
 TIMEOUT = 180

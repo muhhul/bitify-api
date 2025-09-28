@@ -17,7 +17,7 @@ async def check_capacity(mp3: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(400, f"Failed to decode MP3: {e}")
     frames = len(pcm)
-    capacities = {str(n): metrics.capacity_bytes(frames, ch, n) for n in (1, 2, 3, 4)}
+    capacities = {str(n): metrics.capacity_bytes(frames, ch, n) for n in range(1, 9)}
     # Header Bitify minimal 19 byte + panjang nama file (0..255)
     return {
         "sample_rate": sr,
@@ -37,8 +37,8 @@ async def embed(
     encrypt: bool = Form(False),
     random_start: bool = Form(False),
 ):
-    if not (1 <= nlsb <= 4):
-        raise HTTPException(422, "nlsb must be 1..4")
+    if not (1 <= nlsb <= 8):
+        raise HTTPException(422, "nlsb must be 1..8")
     key = key[:25]
     cover_bytes = await cover.read()
     secret_bytes = await secret.read()
@@ -91,7 +91,7 @@ async def extract(
         hdr = None
         consumed = None
 
-        for nlsb in (1, 2, 3, 4):
+        for nlsb in range(1, 9):
             samples_for_hdr = (HEADER_MAX * 8 + nlsb - 1) // nlsb
             raw0 = stego_lsb.extract(
                 pcm[:samples_for_hdr],
@@ -112,7 +112,7 @@ async def extract(
 
         if start_idx is None:
             # sliding search (lambat)
-            for nlsb in (1, 2, 3, 4):
+            for nlsb in range(1, 9):
                 samples_for_hdr = (HEADER_MAX * 8 + nlsb - 1) // nlsb
                 step = max(1, samples_for_hdr // 8)
                 limit = max(0, len(pcm) - samples_for_hdr)
